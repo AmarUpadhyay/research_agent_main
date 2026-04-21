@@ -31,6 +31,16 @@ public class AgentExecutor {
 
     private static final int DEFAULT_MAX_STEPS = 4;
     private static final Pattern EMAIL_PATTERN = Pattern.compile("[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\\.[A-Za-z]{2,}");
+    private static final Pattern CAPABILITY_QUESTION_PATTERN = Pattern.compile(
+            "(show\\s+me\\s+what\\s+(?:this\\s+)?(?:application|app|agent|system)\\s+can\\s+do)"
+                    + "|(what\\s+(?:can|does)\\s+(?:this\\s+)?(?:application|app|agent|system).*(?:do|support))"
+                    + "|(explain\\s+(?:what\\s+)?(?:this\\s+)?(?:application|app|agent|system)\\s+can\\s+do)"
+                    + "|((?:application|app|agent|system)\\s+(?:capabilities|overview))"
+                    + "|(capabilities)"
+                    + "|(overview.*(?:memory|database|email|logging))"
+                    + "|((?:memory|database|email|logging).*(?:capabilities|overview))",
+            Pattern.CASE_INSENSITIVE
+    );
     private static final Pattern EQUALS_FILTER_PATTERN = Pattern.compile(
             "(?:^|\\b)(name|email|category|price|stock|id)\\s*(?:=|is|equals|equal to)\\s*['\"]?([A-Za-z0-9@._%+-]+)['\"]?",
             Pattern.CASE_INSENSITIVE
@@ -91,6 +101,26 @@ public class AgentExecutor {
         AgentTask task = memoryStore.createTask(goal, DEFAULT_MAX_STEPS);
         task.setStatus(AgentTaskStatus.RUNNING);
         memoryStore.saveTask(task);
+
+        if (isCapabilityOverviewGoal(goal)) {
+            task.addStep(new AgentStep(
+                    1,
+                    AgentStepType.PLAN,
+                    "This is a capability/overview question, so answer directly without calling tools.",
+                    null
+            ));
+            String finalResponse = buildCapabilityOverviewResponse();
+            task.addStep(new AgentStep(
+                    2,
+                    AgentStepType.FINAL,
+                    finalResponse,
+                    null
+            ));
+            task.setStatus(AgentTaskStatus.COMPLETED);
+            task.setFinalResponse(finalResponse);
+            memoryStore.saveTask(task);
+            return task;
+        }
 
         int stepCounter = 1;
 
@@ -436,6 +466,10 @@ public class AgentExecutor {
             return false;
         }
 
+        if (isCapabilityOverviewGoal(goal)) {
+            return false;
+        }
+
         String g = goal.toLowerCase();
 
         return g.contains("count")
@@ -754,6 +788,9 @@ public class AgentExecutor {
 
     private List<String> requiredToolsForGoal(String goal) {
         java.util.ArrayList<String> requiredTools = new java.util.ArrayList<>();
+        if (isCapabilityOverviewGoal(goal)) {
+            return requiredTools;
+        }
         if (goalNeedsDatabase(goal)) {
             requiredTools.add("database");
         }
@@ -768,6 +805,9 @@ public class AgentExecutor {
 
     private boolean goalNeedsDatabase(String goal) {
         if (goal == null) {
+            return false;
+        }
+        if (isCapabilityOverviewGoal(goal)) {
             return false;
         }
         String g = goal.toLowerCase();
@@ -790,6 +830,9 @@ public class AgentExecutor {
         if (goal == null) {
             return false;
         }
+        if (isCapabilityOverviewGoal(goal)) {
+            return false;
+        }
         String g = goal.toLowerCase();
         return g.contains("send email")
                 || g.contains("send an email")
@@ -808,10 +851,30 @@ public class AgentExecutor {
         if (goal == null) {
             return false;
         }
+        if (isCapabilityOverviewGoal(goal)) {
+            return false;
+        }
         String g = goal.toLowerCase();
         return g.contains("log")
                 || g.contains("logging")
                 || g.contains("audit");
+    }
+
+    private boolean isCapabilityOverviewGoal(String goal) {
+        if (goal == null || goal.isBlank()) {
+            return false;
+        }
+        return CAPABILITY_QUESTION_PATTERN.matcher(goal).find();
+    }
+
+    private String buildCapabilityOverviewResponse() {
+        return "This application can coordinate AI-driven workflows across four main areas: "
+                + "memory, database access, email, and logging. "
+                + "For memory, it stores task history and semantic memories in PostgreSQL with pgvector so the agent can recall relevant prior context. "
+                + "For database access, it turns structured intent into precise read-only queries and runs them through a guarded MCP PostgreSQL server. "
+                + "For email, it can prepare and send workflow-driven notifications when the goal explicitly asks for email delivery. "
+                + "For logging, it can write audit-style execution messages for traceability. "
+                + "It also exposes task execution APIs, step-by-step traces, and a chat-style UI for interacting with those workflows.";
     }
 
     private boolean looksLikeError(String content) {

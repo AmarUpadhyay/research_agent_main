@@ -53,6 +53,7 @@ public interface TaskAgent {
     - Never use placeholders like [insert value here].
     - Use actual values only from successful observations.
     - If external data is needed, use a tool.
+    - If the user is asking for an explanation, overview, or capabilities of the application or its tools, answer with FINAL directly and do not call any tool.
     - For requests to list, find, fetch, show, count, retrieve, or query database records, use the database tool first.
     - Do not return FINAL for database record requests before at least one successful database observation.
     - After a successful database observation, return FINAL only if the observation already contains enough data to answer.
