@@ -1,0 +1,49 @@
+spring:
+  application:
+    name: ai-agent-app
+  datasource:
+    url: ${DB_URL:jdbc:postgresql://localhost:5433/mydb}
+    username: ${DB_USERNAME:postgres}
+    password: ${DB_PASSWORD:postgres}
+    driver-class-name: org.postgresql.Driver
+  jpa:
+    hibernate:
+      ddl-auto: update
+      naming:
+        physical-strategy: org.hibernate.boot.model.naming.PhysicalNamingStrategyStandardImpl
+    properties:
+      hibernate:
+        globally_quoted_identifiers: true
+
+server:
+  port: 8080
+
+ai:
+  ollama:
+    base-url: ${OLLAMA_BASE_URL:http://127.0.0.1:11434}
+    model: ${OLLAMA_MODEL:gemma3:4b}
+    embedding-model: ${OLLAMA_EMBEDDING_MODEL:nomic-embed-text}
+
+agent:
+  memory:
+    embedding-dimensions: ${AGENT_MEMORY_EMBEDDING_DIMENSIONS:768}
+  database:
+    default-limit: ${AGENT_DB_DEFAULT_LIMIT:20}
+    schema-name: ${AGENT_DB_SCHEMA_NAME:public}
+    schema-context-ttl-seconds: ${AGENT_DB_SCHEMA_TTL_SECONDS:300}
+    mcp:
+      command: ${AGENT_DB_MCP_COMMAND:java}
+      jar-path: ${AGENT_DB_MCP_JAR_PATH:postgres-readonly-mcp-server/target/postgres-readonly-mcp-server-1.0.0.jar}
+      request-timeout-seconds: ${AGENT_DB_MCP_REQUEST_TIMEOUT_SECONDS:20}
+      initialization-timeout-seconds: ${AGENT_DB_MCP_INITIALIZATION_TIMEOUT_SECONDS:20}
+      db-url: ${AGENT_DB_MCP_DB_URL:jdbc:postgresql://localhost:5433/mydb}
+      db-username: ${AGENT_DB_MCP_DB_USERNAME:postgres}
+      db-password: ${AGENT_DB_MCP_DB_PASSWORD:postgres}
+      allowed-schemas: ${AGENT_DB_MCP_ALLOWED_SCHEMAS:public}
+      max-rows: ${AGENT_DB_MCP_MAX_ROWS:20}
+      statement-timeout-seconds: ${AGENT_DB_MCP_STATEMENT_TIMEOUT_SECONDS:30}
+
+security:
+  jwt:
+    secret: ${JWT_SECRET:change-me-change-me-change-me-change-me-change-me-change-me}
+    expiration-millis: ${JWT_EXPIRATION_MILLIS:86400000}

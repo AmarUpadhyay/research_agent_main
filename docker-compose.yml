@@ -1,0 +1,25 @@
+version: "3.9"
+
+services:
+  pgvector:
+    image: pgvector/pgvector:pg18-trixie
+    container_name: research-agent-pgvector
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_DB: mydb
+    ports:
+      - "5433:5432"
+    volumes:
+      - pgvector-data:/var/lib/postgresql/data
+      - ./docker/postgres/init:/docker-entrypoint-initdb.d:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d mydb"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 10s
+
+volumes:
+  pgvector-data:
