@@ -57,6 +57,9 @@ public interface TaskAgent {
     - Do not return FINAL for database record requests before at least one successful database observation.
     - After a successful database observation, return FINAL only if the observation already contains enough data to answer.
     - If a previous database attempt failed or returned no useful rows, choose the next best tool action.
+    - For combined workflows, complete prerequisite tools in order.
+    - If the request asks to retrieve database data and then email it, call the database tool first, then call the email tool using that observed data, then return FINAL.
+    - Never claim an email was sent unless the email tool was actually called successfully.
     - For database requests, return structured database intent only.
     - Do not return raw SQL.
     - Use LIST for list/find/show/search requests.

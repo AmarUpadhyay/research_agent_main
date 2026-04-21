@@ -12,20 +12,49 @@ import com.researchagent.model.AgentTaskStatus;
 import com.researchagent.model.ToolResult;
 import com.researchagent.tools.AgentTool;
 import com.researchagent.tools.database.DatabaseIntent;
+import com.researchagent.tools.database.DatabaseOperation;
 import com.researchagent.tools.database.DatabaseIntentValidator;
 import com.researchagent.tools.database.DatabaseResultFormatter;
 import com.researchagent.tools.database.DatabaseSchemaRegistry;
+import com.researchagent.tools.database.FilterCondition;
 import com.researchagent.tools.database.SqlBuilder;
 import org.springframework.stereotype.Component;
 
 import java.util.List;
 import java.util.Map;
+import java.util.regex.Matcher;
+import java.util.regex.Pattern;
 import java.util.stream.Collectors;
 
 @Component
 public class AgentExecutor {
 
     private static final int DEFAULT_MAX_STEPS = 4;
+    private static final Pattern EMAIL_PATTERN = Pattern.compile("[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\\.[A-Za-z]{2,}");
+    private static final Pattern EQUALS_FILTER_PATTERN = Pattern.compile(
+            "(?:^|\\b)(name|email|category|price|stock|id)\\s*(?:=|is|equals|equal to)\\s*['\"]?([A-Za-z0-9@._%+-]+)['\"]?",
+            Pattern.CASE_INSENSITIVE
+    );
+    private static final Pattern NAMED_FILTER_PATTERN = Pattern.compile(
+            "(?:named|having\\s+name|with\\s+name)\\s+['\"]?([A-Za-z][A-Za-z0-9_-]*)['\"]?",
+            Pattern.CASE_INSENSITIVE
+    );
+    private static final Pattern STARTS_WITH_FILTER_PATTERN = Pattern.compile(
+            "(name|email|category)\\s+(?:starting with|starts with|beginning with|begins with)\\s+['\"]?([A-Za-z0-9@._%+-]+)['\"]?",
+            Pattern.CASE_INSENSITIVE
+    );
+    private static final Pattern CONTAINS_FILTER_PATTERN = Pattern.compile(
+            "(name|email|category)\\s+(?:containing|contains|with)\\s+['\"]?([A-Za-z0-9@._%+-]+)['\"]?",
+            Pattern.CASE_INSENSITIVE
+    );
+    private static final Pattern GREATER_THAN_FILTER_PATTERN = Pattern.compile(
+            "(price|stock|id)\\s+(?:greater than|more than|above|over)\\s+['\"]?([0-9]+(?:\\.[0-9]+)?)['\"]?",
+            Pattern.CASE_INSENSITIVE
+    );
+    private static final Pattern LESS_THAN_FILTER_PATTERN = Pattern.compile(
+            "(price|stock|id)\\s+(?:less than|below|under)\\s+['\"]?([0-9]+(?:\\.[0-9]+)?)['\"]?",
+            Pattern.CASE_INSENSITIVE
+    );
 
     private final TaskAgent taskAgent;
     private final MemoryStore memoryStore;
@@ -94,13 +123,14 @@ public class AgentExecutor {
             ));
 
             if ("FINAL".equalsIgnoreCase(decision.getDecisionType())) {
-                if (requiresToolExecution(task.getGoal()) && !hasSuccessfulObservation(task)) {
+                if (requiresToolExecution(task.getGoal()) && !hasSatisfiedRequiredTools(task)) {
                     task.addStep(new AgentStep(
                             stepCounter++,
                             AgentStepType.OBSERVATION,
-                            "Premature FINAL blocked. External data is still required, so call the appropriate tool before answering.",
+                            buildMissingToolMessage(task, "Premature FINAL blocked."),
                             null
                     ));
+                    stepCounter = attemptRequiredToolRecovery(task, stepCounter);
                     memoryStore.saveTask(task);
                     continue;
                 }
@@ -144,6 +174,18 @@ public class AgentExecutor {
                 task.setFinalResponse("Execution failed because the agent requested an unknown tool.");
                 memoryStore.saveTask(task);
                 return task;
+            }
+
+            if (isToolOrderViolation(task, decision.getToolName())) {
+                task.addStep(new AgentStep(
+                        stepCounter++,
+                        AgentStepType.OBSERVATION,
+                        buildToolOrderViolationMessage(task.getGoal(), decision.getToolName()),
+                        null
+                ));
+                stepCounter = attemptRequiredToolRecovery(task, stepCounter);
+                memoryStore.saveTask(task);
+                continue;
             }
 
             if ("database".equalsIgnoreCase(decision.getToolName())) {
@@ -314,6 +356,17 @@ public class AgentExecutor {
                 return task;
             }
 
+            if (goalNeedsEmailTool(task.getGoal()) || goalNeedsLogging(task.getGoal())) {
+                task.addStep(new AgentStep(
+                        stepCounter++,
+                        AgentStepType.OBSERVATION,
+                        "Database data retrieved successfully. Continue with the remaining required tool steps before returning FINAL.",
+                        null
+                ));
+                memoryStore.saveTask(task);
+                return task;
+            }
+
             String finalResponse = databaseResultFormatter.format(databaseIntent, output);
 
             task.addStep(new AgentStep(
@@ -400,16 +453,365 @@ public class AgentExecutor {
                 || g.contains("excel");
     }
 
+    private boolean hasSatisfiedRequiredTools(AgentTask task) {
+        List<String> requiredTools = requiredToolsForGoal(task.getGoal());
+        if (requiredTools.isEmpty()) {
+            return hasSuccessfulObservation(task);
+        }
+
+        for (String requiredTool : requiredTools) {
+            if (!hasSuccessfulToolObservation(task, requiredTool)) {
+                return false;
+            }
+        }
+        return true;
+    }
+
     private boolean hasSuccessfulObservation(AgentTask task) {
         for (AgentStep step : task.getSteps()) {
-            if (step.getType() == AgentStepType.OBSERVATION) {
-                String content = step.getContent();
-                if (content != null && !content.isBlank() && !looksLikeError(content)) {
-                    return true;
-                }
+            if (isSuccessfulToolObservation(step)) {
+                return true;
             }
         }
         return false;
+    }
+
+    private boolean hasSuccessfulToolObservation(AgentTask task, String toolName) {
+        for (AgentStep step : task.getSteps()) {
+            if (!isSuccessfulToolObservation(step)) {
+                continue;
+            }
+            ToolResult toolResult = step.getToolResult();
+            if (toolResult != null && toolName.equalsIgnoreCase(toolResult.getToolName())) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    private boolean isSuccessfulToolObservation(AgentStep step) {
+        if (step == null || step.getType() != AgentStepType.OBSERVATION) {
+            return false;
+        }
+        ToolResult toolResult = step.getToolResult();
+        return toolResult != null
+                && toolResult.isSuccess()
+                && toolResult.getOutput() != null
+                && !toolResult.getOutput().isBlank()
+                && !looksLikeError(toolResult.getOutput());
+    }
+
+    private boolean isToolOrderViolation(AgentTask task, String requestedTool) {
+        if ("email".equalsIgnoreCase(requestedTool)
+                && goalNeedsDatabase(task.getGoal())
+                && !hasSuccessfulToolObservation(task, "database")) {
+            return true;
+        }
+
+        if ("logging".equalsIgnoreCase(requestedTool)
+                && goalNeedsDatabase(task.getGoal())
+                && goalNeedsLogging(task.getGoal())
+                && !hasSuccessfulToolObservation(task, "database")) {
+            return true;
+        }
+
+        return false;
+    }
+
+    private String buildToolOrderViolationMessage(String goal, String requestedTool) {
+        if ("email".equalsIgnoreCase(requestedTool) && goalNeedsDatabase(goal)) {
+            return "Email step blocked. Retrieve the required database data first, then call the email tool with that observed data.";
+        }
+        if ("logging".equalsIgnoreCase(requestedTool) && goalNeedsDatabase(goal)) {
+            return "Logging step blocked. Retrieve the required database data first, then log the relevant outcome.";
+        }
+        return "Tool step blocked. Complete required prerequisite tool calls first.";
+    }
+
+    private String buildMissingToolMessage(AgentTask task, String prefix) {
+        List<String> missingTools = missingRequiredTools(task);
+        if (missingTools.isEmpty()) {
+            return prefix + " External data is still required, so call the appropriate tool before answering.";
+        }
+        return prefix + " Required tool steps still missing: " + String.join(", ", missingTools) + ".";
+    }
+
+    private List<String> missingRequiredTools(AgentTask task) {
+        return requiredToolsForGoal(task.getGoal()).stream()
+                .filter(toolName -> !hasSuccessfulToolObservation(task, toolName))
+                .toList();
+    }
+
+    private int attemptRequiredToolRecovery(AgentTask task, int stepCounter) {
+        List<String> missingTools = missingRequiredTools(task);
+
+        if (missingTools.contains("database")) {
+            return executeSynthesizedDatabaseStep(task, stepCounter);
+        }
+
+        if (missingTools.contains("email") && hasSuccessfulToolObservation(task, "database")) {
+            return executeSynthesizedEmailStep(task, stepCounter);
+        }
+
+        return stepCounter;
+    }
+
+    private int executeSynthesizedDatabaseStep(AgentTask task, int stepCounter) {
+        AgentTool databaseTool = toolsByName.get("database");
+        if (databaseTool == null) {
+            return stepCounter;
+        }
+
+        DatabaseIntent databaseIntent = buildDatabaseIntentFromGoal(task.getGoal());
+        task.addStep(new AgentStep(
+                stepCounter++,
+                AgentStepType.OBSERVATION,
+                "Executor recovery: synthesized the required database step from the user goal.",
+                null
+        ));
+
+        AgentDecision synthesizedDecision = new AgentDecision();
+        synthesizedDecision.setToolName("database");
+        synthesizedDecision.setToolInput(objectMapper.convertValue(databaseIntent, Map.class));
+        executeDatabaseStep(task, databaseTool, synthesizedDecision, stepCounter);
+        return task.getSteps().size() + 1;
+    }
+
+    private int executeSynthesizedEmailStep(AgentTask task, int stepCounter) {
+        AgentTool emailTool = toolsByName.get("email");
+        if (emailTool == null) {
+            return stepCounter;
+        }
+
+        String recipient = extractEmailAddress(task.getGoal());
+        if (recipient == null || recipient.isBlank()) {
+            task.addStep(new AgentStep(
+                    stepCounter++,
+                    AgentStepType.OBSERVATION,
+                    "Executor recovery could not continue the email step because no valid recipient address was found in the goal.",
+                    null
+            ));
+            return stepCounter;
+        }
+
+        String body = buildEmailBodyFromLatestDatabaseObservation(task);
+        Map<String, Object> emailInput = Map.of(
+                "recipient", recipient,
+                "subject", "Requested data from Research Agent",
+                "body", body
+        );
+
+        if (isRepeatedToolCall(task, "email", emailInput)) {
+            return stepCounter;
+        }
+
+        task.addStep(new AgentStep(
+                stepCounter++,
+                AgentStepType.ACTION,
+                "Executor recovery: calling tool 'email' with recipient " + recipient,
+                null
+        ));
+
+        ToolResult result = emailTool.execute(emailInput);
+        task.addStep(new AgentStep(
+                stepCounter++,
+                AgentStepType.OBSERVATION,
+                defaultText(result.getOutput(), "Email tool executed with no output."),
+                result
+        ));
+        return stepCounter;
+    }
+
+    private DatabaseIntent buildDatabaseIntentFromGoal(String goal) {
+        DatabaseIntent intent = new DatabaseIntent();
+        intent.setEntity(inferEntityFromGoal(goal));
+        intent.setOperation(DatabaseOperation.LIST);
+        intent.setColumns(inferColumnsFromGoal(goal, intent.getEntity()));
+        intent.setFilters(inferFiltersFromGoal(goal, intent.getEntity()));
+        intent.setLimit(20);
+        return intent;
+    }
+
+    private String inferEntityFromGoal(String goal) {
+        if (goal == null) {
+            return "User";
+        }
+        String lower = goal.toLowerCase();
+        if (lower.contains("product")) {
+            return "Product";
+        }
+        return "User";
+    }
+
+    private List<String> inferColumnsFromGoal(String goal, String entity) {
+        String lower = goal == null ? "" : goal.toLowerCase();
+        if ("User".equalsIgnoreCase(entity)) {
+            java.util.ArrayList<String> columns = new java.util.ArrayList<>();
+            if (lower.contains("name")) {
+                columns.add("name");
+            }
+            if (lower.contains("email")) {
+                columns.add("email");
+            }
+            if (columns.isEmpty()) {
+                columns.add("id");
+                columns.add("name");
+                columns.add("email");
+            }
+            return columns;
+        }
+        return databaseSchemaRegistry.getSafeColumns(entity);
+    }
+
+    private List<FilterCondition> inferFiltersFromGoal(String goal, String entity) {
+        if (goal == null || goal.isBlank()) {
+            return List.of();
+        }
+
+        java.util.ArrayList<FilterCondition> filters = new java.util.ArrayList<>();
+
+        if ("User".equalsIgnoreCase(entity)) {
+            addNamedFilter(goal, filters);
+        }
+
+        addPatternFilters(goal, entity, filters, EQUALS_FILTER_PATTERN, "EQUALS");
+        addPatternFilters(goal, entity, filters, STARTS_WITH_FILTER_PATTERN, "STARTS_WITH");
+        addPatternFilters(goal, entity, filters, CONTAINS_FILTER_PATTERN, "CONTAINS");
+        addPatternFilters(goal, entity, filters, GREATER_THAN_FILTER_PATTERN, "GREATER_THAN");
+        addPatternFilters(goal, entity, filters, LESS_THAN_FILTER_PATTERN, "LESS_THAN");
+
+        return dedupeFilters(filters);
+    }
+
+    private void addNamedFilter(String goal, List<FilterCondition> filters) {
+        Matcher matcher = NAMED_FILTER_PATTERN.matcher(goal);
+        while (matcher.find()) {
+            filters.add(createFilter("name", "EQUALS", matcher.group(1)));
+        }
+    }
+
+    private void addPatternFilters(
+            String goal,
+            String entity,
+            List<FilterCondition> filters,
+            Pattern pattern,
+            String operator
+    ) {
+        Matcher matcher = pattern.matcher(goal);
+        while (matcher.find()) {
+            String field = matcher.group(1);
+            String value = matcher.group(2);
+            if (field == null || value == null) {
+                continue;
+            }
+            if (!databaseSchemaRegistry.isValidColumn(entity, field)) {
+                continue;
+            }
+            filters.add(createFilter(field.toLowerCase(), operator, value));
+        }
+    }
+
+    private List<FilterCondition> dedupeFilters(List<FilterCondition> filters) {
+        java.util.LinkedHashMap<String, FilterCondition> unique = new java.util.LinkedHashMap<>();
+        for (FilterCondition filter : filters) {
+            if (filter == null) {
+                continue;
+            }
+            String key = filter.getField() + "|" + filter.getOperator() + "|" + filter.getValue();
+            unique.putIfAbsent(key, filter);
+        }
+        return List.copyOf(unique.values());
+    }
+
+    private FilterCondition createFilter(String field, String operator, String value) {
+        FilterCondition filter = new FilterCondition();
+        filter.setField(field);
+        filter.setOperator(operator);
+        filter.setValue(value);
+        return filter;
+    }
+
+    private String extractEmailAddress(String text) {
+        if (text == null) {
+            return null;
+        }
+        Matcher matcher = EMAIL_PATTERN.matcher(text);
+        return matcher.find() ? matcher.group() : null;
+    }
+
+    private String buildEmailBodyFromLatestDatabaseObservation(AgentTask task) {
+        for (int i = task.getSteps().size() - 1; i >= 0; i--) {
+            AgentStep step = task.getSteps().get(i);
+            if (isSuccessfulToolObservation(step)) {
+                ToolResult toolResult = step.getToolResult();
+                if (toolResult != null && "database".equalsIgnoreCase(toolResult.getToolName())) {
+                    return "Requested data:\n" + defaultText(step.getContent(), toolResult.getOutput());
+                }
+            }
+        }
+        return "Requested data was retrieved successfully.";
+    }
+
+    private List<String> requiredToolsForGoal(String goal) {
+        java.util.ArrayList<String> requiredTools = new java.util.ArrayList<>();
+        if (goalNeedsDatabase(goal)) {
+            requiredTools.add("database");
+        }
+        if (goalNeedsEmailTool(goal)) {
+            requiredTools.add("email");
+        }
+        if (goalNeedsLogging(goal)) {
+            requiredTools.add("logging");
+        }
+        return requiredTools;
+    }
+
+    private boolean goalNeedsDatabase(String goal) {
+        if (goal == null) {
+            return false;
+        }
+        String g = goal.toLowerCase();
+        return g.contains("list")
+                || g.contains("find")
+                || g.contains("fetch")
+                || g.contains("show")
+                || g.contains("search")
+                || g.contains("retrieve")
+                || g.contains("database")
+                || g.contains("user")
+                || g.contains("users")
+                || g.contains("product")
+                || g.contains("products")
+                || g.contains("record")
+                || g.contains("records");
+    }
+
+    private boolean goalNeedsEmailTool(String goal) {
+        if (goal == null) {
+            return false;
+        }
+        String g = goal.toLowerCase();
+        return g.contains("send email")
+                || g.contains("send an email")
+                || g.contains("send mail")
+                || g.contains("mail to")
+                || g.contains("email to")
+                || g.contains("email it to")
+                || g.contains("email them to")
+                || g.contains("send it to")
+                || g.contains("send them to")
+                || g.contains("share via email")
+                || EMAIL_PATTERN.matcher(goal).find();
+    }
+
+    private boolean goalNeedsLogging(String goal) {
+        if (goal == null) {
+            return false;
+        }
+        String g = goal.toLowerCase();
+        return g.contains("log")
+                || g.contains("logging")
+                || g.contains("audit");
     }
 
     private boolean looksLikeError(String content) {
@@ -460,6 +862,9 @@ public class AgentExecutor {
         builder.append("- For requests asking to list, count, fetch, find, retrieve, search, or query records, use the database tool first.\n");
         builder.append("- Do not return FINAL before at least one successful tool observation when external data is required.\n");
         builder.append("- If external data is required and no successful observation exists yet, decisionType must be TOOL.\n");
+        builder.append("- For combined workflows, complete prerequisite tools in order before moving on.\n");
+        builder.append("- If the goal requires database data and then sending an email, call database first, then email, then FINAL.\n");
+        builder.append("- Do not call email or logging before the required database observation exists.\n");
         builder.append("- For database tool calls, return structured database intent only, not raw SQL.\n");
         builder.append("- Use LIST for list/find/show/search requests.\n");
         builder.append("- Use COUNT only when the user explicitly asks for count, total, or how many.\n");
